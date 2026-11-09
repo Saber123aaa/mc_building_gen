@@ -67,6 +67,7 @@ function curvePoints(path, mode = 'straight', radius = 6) {
       const A = P[s - 1], Bp = P[s], C = P[s + 1];
       const u = [A[0] - Bp[0], A[1] - Bp[1]], v = [C[0] - Bp[0], C[1] - Bp[1]], lu = Math.hypot(...u), lv = Math.hypot(...v);
       const cos = (u[0] * v[0] + u[1] * v[1]) / (lu * lv), th = Math.acos(Math.max(-1, Math.min(1, cos)));
+      if (th < 0.02) { line(cur, Bp, s - 1, out.length > 0); cur = Bp; continue; } // a hairpin has no finite fillet
       if (th > Math.PI - 0.02) { line(cur, Bp, s - 1, out.length > 0); cur = Bp; continue; }   // nearly straight
       let r = radius, t = r / Math.tan(th / 2);
       const tmax = Math.min(lu, lv) / 2; if (t > tmax) { t = tmax; r = t * Math.tan(th / 2); }
@@ -106,6 +107,7 @@ function traceLine(path) {
   const out = []; out.seg = [];
   for (let s = 0; s + 1 < path.length; s++) {
     const [ax, az] = path[s], [bx, bz] = path[s + 1], n = Math.max(Math.abs(bx - ax), Math.abs(bz - az)) * 2;
+    if (!n) continue;
     for (let i = 0; i <= n; i++) {
       const x = Math.round(ax + (bx - ax) * i / n), z = Math.round(az + (bz - az) * i / n), l = out[out.length - 1];
       if (!l || l[0] !== x || l[1] !== z) { out.push([x, z]); out.seg.push(s); }
@@ -119,8 +121,9 @@ function traceLine(path) {
 // cells since the last step). A step of one level is only allowed once `run` cells have passed
 // since the previous one, so the slope limit holds everywhere; bridge decks are hard minimums and
 // the approaches find their own ramps.
-function gradeLine(T, cells, run, win = 1, spans = [], fixed = null) {
+function gradeLine(T, cells, run, win = 1, spans = [], fixed = null, design = {}) {
   const n = cells.length, R = i => Math.max(1, Array.isArray(run) ? run[Math.min(i, run.length - 1)] || 3 : run);
+  if (!n) return [];
   const raw = cells.map(([x, z]) => T.inside(x, z) ? T.H(x, z) : null);
   const g0 = raw.map(v => v ?? raw.find(u => u !== null) ?? 0);
   const g = g0.map((_, i) => { let s = 0, k = 0; for (let j = i - win; j <= i + win; j++) if (j >= 0 && j < n) { s += g0[j]; k++; } return s / k; });
@@ -130,7 +133,8 @@ function gradeLine(T, cells, run, win = 1, spans = [], fixed = null) {
   let lo = Math.floor(Math.min(...g, ...fx)) - 2, hi = Math.ceil(Math.max(...g, ...fx, ...floor.filter(isFinite))) + 2;
   const H = hi - lo + 1, C = Math.max(...cells.map((_, i) => R(i))) + 1, S = H * C, INF = 1e18;
   // a cell that is already a road (a junction) must keep that road's level exactly
-  const cost = (i, L) => L < floor[i] || (fixed && fixed[i] != null && L !== fixed[i]) ? INF : Math.abs(L - g[i]);
+  const cost = (i, L) => L < floor[i] || (fixed && fixed[i] != null && L !== fixed[i]) ? INF
+    : Math.abs(L - g[i]) + ((i < 2 || i >= n - 2) ? 2 * Math.abs(L - g0[i]) : 0);
   let cur = new Float64Array(S).fill(INF);
   const back = new Int32Array(n * S).fill(-1);
   for (let h = 0; h < H; h++) cur[h * C + (C - 1)] = cost(0, lo + h);
@@ -142,16 +146,23 @@ function gradeLine(T, cells, run, win = 1, spans = [], fixed = null) {
       const c2 = Math.min(C - 1, c + 1), k = h * C + c2, w = v + ci(lo + h);
       if (w < nxt[k]) { nxt[k] = w; back[i * S + k] = h * C + c; }
       // one step up / down (tiny penalty so it never steps for nothing)
-      if (c + 1 >= need) for (const dh of [-1, 1]) {
+      if (c + 1 >= need && !(design.flatEdges && design.flatEdges.has(i)) && !(design.hardFlatEdges && design.hardFlatEdges.has(i))) for (const dh of [-1, 1]) {
         const h2 = h + dh; if (h2 < 0 || h2 >= H) continue;
-        const k2 = h2 * C, w2 = v + ci(lo + h2) + 0.05;
+        const k2 = h2 * C, w2 = v + ci(lo + h2) + (design.stepCost ?? 0.05);
         if (w2 < nxt[k2]) { nxt[k2] = w2; back[i * S + k2] = h * C + c; }
       }
     }
     cur = nxt;
   }
   let best = 0; for (let k = 1; k < S; k++) if (cur[k] < cur[best]) best = k;
-  if (cur[best] >= INF && fixed) return gradeLine(T, cells, run, win, spans, null);
+  if (cur[best] >= INF) {
+    // Relax optional rest landings before giving up; existing junction levels are never discarded.
+    if (design.flatEdges && design.flatEdges.size) {
+      const retry = gradeLine(T, cells, run, win, spans, fixed, { ...design, flatEdges: null });
+      retry.landingsRelaxed = true; return retry;
+    }
+    const failed = []; failed.feasible = false; return failed;
+  }
   const lv = new Array(n);
   for (let i = n - 1; i >= 0; i--) { lv[i] = lo + Math.floor(best / C); if (i) best = back[i * S + best]; }
   return lv;
@@ -175,7 +186,27 @@ function bridgeSpans(T, cells, half, warn = [], strict = false) {
     else { cur = { a: i, b: i, top: t }; spans.push(cur); }
   });
   // reach a little onto the banks so the deck lands on dry ground
-  for (const sp of spans) { sp.a = Math.max(0, sp.a - 1); sp.b = Math.min(cells.length - 1, sp.b + 1); sp.deck = sp.top + 3; }
+  for (const sp of spans) {
+    sp.wetA = sp.a; sp.wetB = sp.b;
+    // Find a bank across the whole deck, including diagonal shorelines. Do not grow past the route.
+    const dry = i => {
+      const a = cells[Math.max(0, i - 1)], b = cells[Math.min(cells.length - 1, i + 1)];
+      const dx = b[0] - a[0], dz = b[1] - a[1], len = Math.hypot(dx, dz) || 1;
+      for (let d = -Math.ceil(half + 1); d <= half + 1; d++) {
+        const x = Math.round(cells[i][0] - dz / len * d), z = Math.round(cells[i][1] + dx / len * d);
+        if (!T.inside(x, z) || waterTop(T, x, z) != null) return false;
+      }
+      return true;
+    };
+    for (const dir of [-1, 1]) {
+      let edge = dir < 0 ? sp.a : sp.b;
+      for (let k = 0; k < 6; k++) { const next = edge + dir; if (next < 0 || next >= cells.length) break; edge = next; if (dry(edge)) break; }
+      if (dir < 0) sp.a = edge; else sp.b = edge;
+    }
+    sp.deck = sp.top + 3;
+    if (!dry(sp.a) || !dry(sp.b)) warn.push('桥头附近没有完整干岸，已保留水道；请延长路线或调整跨河位置');
+    if (sp.a < 3 || cells.length - 1 - sp.b < 3) warn.push('桥头靠近路线端点，引道与平台按可用长度截断');
+  }
   return spans.filter(sp => {
     const len = sp.b - sp.a + 1;
     if (len < 16) return true;
@@ -198,10 +229,15 @@ function bridgeSpans(T, cells, half, warn = [], strict = false) {
   });
 }
 function street(T, o = {}) {
-  const kind = ROAD_KINDS[o.kind || 'main'], w = o.width || kind.width, run = o.run || kind.run, seed = o.seed || 1;
+  const kind = ROAD_KINDS[o.kind || 'main'] || ROAD_KINDS.main, w = Math.max(3, Math.min(15, Math.round(o.width || kind.width) | 1)), run = Math.max(1, Math.min(8, o.run || kind.run)), seed = o.seed || 1;
+  const path = (o.path || []).filter(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1])).map(p => p.map(Math.round)).filter((p, i, a) => !i || p[0] !== a[i - 1][0] || p[1] !== a[i - 1][1]);
+  const empty = message => ({ failed: true, cells: [], levels: [], road: [], props: { lamp: 0, tree: 0 }, steps: 0,
+    bridge: { spans: 0, length: 0, piers: 0 }, viaduct: 0, retain: { cells: 0, height: 0 }, quay: 0, warnings: [message], rise: 0, length: 0, width: w, kind: kind.label });
+  if (path.length < 2) return empty('路线至少需要两个不同的有效坐标，未生成道路');
   const curve = ROAD_CURVES[o.curve] ? o.curve : 'straight';
-  const fine = curve === 'straight' ? null : curvePoints(o.path, curve, o.radius || Math.max(4, w + 2));
-  const cells = fine ? cellsOfCurve(fine) : traceLine(o.path), half = (w - 1) / 2, shoulder = o.shoulder ?? 2;
+  const fine = curve === 'straight' ? null : curvePoints(path, curve, Math.max(1, o.radius || Math.max(4, w + 2)));
+  const cells = fine ? cellsOfCurve(fine) : traceLine(path), half = (w - 1) / 2, shoulder = Math.max(0, o.shoulder ?? 2);
+  if (!cells.some(([x, z]) => T.inside(x, z))) return empty('路线在地形范围之外，未生成道路');
   const warnings = [];
   const crossing = o.crossing || 'bridge';
   const spans = o.bridges === false || crossing !== 'bridge' ? [] : bridgeSpans(T, cells, half, warnings);
@@ -220,12 +256,39 @@ function street(T, o = {}) {
   }
   // 石堤: the road runs on an embankment one block above the water (the old quay code graded it on the river bed)
   const floors = crossing === 'causeway' ? bridgeSpans(T, cells, half, [], false).map(sp => ({ ...sp, deck: sp.top + 1 })) : spans;
-  const lv = gradeLine(T, cells, runs, 1, floors, fixed.some(v => v != null) ? fixed : null);
+  // Rest landings at road ends, real corners, bridgeheads and existing junctions. A penalty per
+  // rise/fall removes small terrain-induced humps without changing the maximum grade.
+  const flatEdges = new Set(), landing = (at, radius) => { for (let j = Math.max(1, at - radius); j <= Math.min(cells.length - 1, at + radius); j++) flatEdges.add(j); };
+  landing(0, 2); landing(cells.length - 1, 2);
+  for (let i = 1; i + 1 < path.length; i++) {
+    const a = path[i - 1], b = path[i], c = path[i + 1], ux = b[0] - a[0], uz = b[1] - a[1], vx = c[0] - b[0], vz = c[1] - b[1];
+    if ((ux * vx + uz * vz) / (Math.hypot(ux, uz) * Math.hypot(vx, vz)) > 0.78) continue;
+    let at = 0, bd = Infinity; cells.forEach(([x, z], j) => { const d = Math.hypot(x - b[0], z - b[1]); if (d < bd) { bd = d; at = j; } });
+    landing(at, 2);
+  }
+  const hardFlatEdges = new Set();
+  for (const sp of spans) {
+    for (let i = Math.max(1, sp.a - 2); i <= Math.min(cells.length - 1, sp.b + 2); i++) flatEdges.add(i);
+    for (let i = sp.a + 1; i <= sp.b; i++) hardFlatEdges.add(i);
+  }
+  const lv = gradeLine(T, cells, runs, 2, floors, fixed.some(v => v != null) ? fixed : null, { flatEdges, hardFlatEdges, stepCost: 1.1 });
+  if (lv.feasible === false) return empty('已有路口高度与限坡条件冲突：未生成这条路，请延长引道或调整路线/坡度');
+  if (lv.landingsRelaxed) warnings.push('可用长度不足，部分休息平台缩短；保留原有路口高度和限坡');
+  const endEarth = [0, cells.length - 1].map(i => T.inside(...cells[i]) ? lv[i] - T.H(...cells[i]) : 0);
+  if (endEarth.some(d => Math.abs(d) > 3)) warnings.push(`端点挖填较大（${endEarth.join(' / ')} 格），建议延长路线或增加折返以贴合原地形`);
+  const approachAt = i => {
+    let best = null;
+    for (const sp of spans) for (const end of [sp.a, sp.b]) { const d = Math.abs(i - end); if (d <= 5 && (!best || d < best.d)) best = { sp, d }; }
+    return best;
+  };
+  // The 8-neighbour parapet consumes sqrt(2) cells at 45 degrees; reserve that diagonal margin
+  // as well, otherwise a nominal three-cell path can leave a disconnected diagonal-only aisle.
+  const halfAt = i => spanOf(i) ? half + 1.5 : half + (approachAt(i) ? Math.max(0, 2 * (1 - approachAt(i).d / 6)) : 0);
   const occupied = o.occupied || new Set(), roadSet = o.roadSet || new Map();
   // nearest centreline point per cell in the corridor
   let bx0 = Infinity, bx1 = -Infinity, bz0 = Infinity, bz1 = -Infinity;
   for (const [x, z] of cells) { bx0 = Math.min(bx0, x); bx1 = Math.max(bx1, x); bz0 = Math.min(bz0, z); bz1 = Math.max(bz1, z); }
-  const pad = Math.ceil(half + shoulder + 1);
+  const pad = Math.ceil(half + shoulder + 3);
   const road = [], blend = [];
   // distances are measured to the true curve (dense float points) when there is one, so the width
   // stays even round bends; a bucket grid keeps the search local
@@ -239,8 +302,9 @@ function street(T, o = {}) {
     const gx = Math.floor(x / BK), gz = Math.floor(z / BK);
     for (let a = -nb; a <= nb; a++) for (let b = -nb; b <= nb; b++) { const L = bucket.get((gx + a) + ',' + (gz + b)); if (L) for (const r of L) { const d = Math.hypot(r[0] - x, r[1] - z); if (d < bd) { bd = d; bi = r[2]; } } }
     const tol = fine ? 0.45 : 0.01;                 // a float curve rarely sits on cell centres
-    if (bd <= half + tol) road.push([x, z, bi, bd]);
-    else if (bd <= half + shoulder + 0.5 + tol) blend.push([x, z, bi, bd]);
+    const localHalf = halfAt(bi);
+    if (bd <= localHalf + tol) road.push([x, z, bi, bd, localHalf]);
+    else if (bd <= localHalf + shoulder + 0.5 + tol) blend.push([x, z, bi, bd, localHalf]);
   }
   const mat = (x, z, d, i = 0) => {
     const u = patchNoise(x, 0, z, deriveSeed(seed, 'road'), 'road', 2), h = _h(seed, 'cell', x, z);
@@ -259,7 +323,7 @@ function street(T, o = {}) {
     if (kind.rut && d < 0.6 && w >= 3) return 'minecraft:' + pickU(u, [['grass_block[snowy=false]', 3], ['coarse_dirt', 1]]);
     return 'minecraft:' + pickU(u, edge && w > 3 ? kind.edge : kind.centre);
   };
-  const bridge = { spans: spans.length, length: 0, piers: 0 }, onBridge = new Set();
+  const bridge = { spans: spans.length, length: 0, piers: 0, abutments: 0, wingWalls: 0, approachCells: 0, requestedClearWidth: w }, onBridge = new Set();
   const BS = BRIDGE_STYLES[o.bridge] ? o.bridge : (kind.bridge || 'stone'), VS = BRIDGE_STYLES[o.viaduct_style] ? o.viaduct_style : BS;
   const bw = o.bridge_wood || 'spruce';
   const PIER = 'minecraft:stone_bricks', DECK = ['stone_bricks', 'stone_bricks', 'cracked_stone_bricks', 'mossy_stone_bricks'];
@@ -276,24 +340,27 @@ function street(T, o = {}) {
   const viaduct = (x, z, i) => fillM.mode === 'viaduct' && lv[i] - orig(x, z) > (fillM.limit ?? 4);
   const deepCut = (x, z, i) => cutM.mode === 'wall' && orig(x, z) - lv[i] > (cutM.limit ?? 3);
   const via = { cells: 0 }, retain = { cells: 0, height: 0 };
-  for (const [x, z, i, d] of road) {
+  const beamAxis = i => { const a = cells[Math.max(0, i - 2)], b = cells[Math.min(cells.length - 1, i + 2)]; return Math.abs(b[0] - a[0]) >= Math.abs(b[1] - a[1]) ? 'x' : 'z'; };
+  for (const [x, z, i, d, localHalf] of road) {
     if (roadSet.has(key3(x, 0, z))) continue;
     const y = lv[i], sp = spanOf(i) || (viaduct(x, z, i) ? VI : null);
     if (sp && T.H(x, z) < y - 1) {
       if (sp === VI) via.cells++;
       // bridge / viaduct deck; the river or ground underneath stays as it was
-      const st = styleKey(sp), u = patchNoise(x, 0, z, deriveSeed(seed, 'deck'), 'deck', 2), edgeC = d > half - 0.6;
+      const st = styleKey(sp), u = patchNoise(x, 0, z, deriveSeed(seed, 'deck'), 'deck', 2), edgeC = d > localHalf - 0.6;
       const wooden = st === 'timber' || st === 'mixed';
-      T.S.set(x, y, z, wooden ? (edgeC ? B(`stripped_${bw}_log`, { axis: 'y' }) : 'minecraft:' + bw + '_planks') : 'minecraft:' + pickU(u, DECK.map(m => [m, 1])));
+      T.S.set(x, y, z, wooden ? (edgeC ? B(`stripped_${bw}_log`, { axis: beamAxis(i) }) : 'minecraft:' + bw + '_planks') : 'minecraft:' + pickU(u, DECK.map(m => [m, 1])));
       for (let k = 1; k <= 4; k++) T.S.del ? T.S.del(x, y + k, z) : T.S.set(x, y + k, z, null);
       const pd = pierDist(sp, i), ground = T.H(x, z);
-      if (pierAt(sp, i)) {
+      const abutment = !sp.vi && (i === sp.a || i === sp.b) && !T.water[T.idx(x, z)];
+      if (abutment || pierAt(sp, i)) {
         // pier: stone, or a timber trestle (two log posts at the road edges, braces between)
         for (let yy = ground + 1; yy < y; yy++) {
-          if (st === 'timber') { if (edgeC || d < 0.6) T.S.set(x, yy, z, B(`${bw}_log`, { axis: 'y' })); else if ((yy - ground) % 3 === 0) T.S.set(x, yy, z, B(`${bw}_fence`, { east: false, north: false, south: false, waterlogged: false, west: false })); }
+          if (st === 'timber' && !abutment) { if (edgeC || d < 0.6) T.S.set(x, yy, z, B(`${bw}_log`, { axis: 'y' })); else if ((yy - ground) % 3 === 0) T.S.set(x, yy, z, B(`${bw}_fence`, { east: false, north: false, south: false, waterlogged: false, west: false })); }
           else T.S.set(x, yy, z, PIER);
         }
-        if (st === 'mixed') T.S.set(x, y - 1, z, B(`${bw}_log`, { axis: 'y' }));   // timber cap on the stone pier
+        if (abutment) bridge.abutments++;
+        if (st === 'mixed') T.S.set(x, y - 1, z, B(`${bw}_log`, { axis: beamAxis(i) === 'x' ? 'z' : 'x' }));
         bridge.piers++;
       } else if (st === 'arch') {
         // semicircular arch between piers: spandrel fill hangs down further near the piers
@@ -302,7 +369,7 @@ function street(T, o = {}) {
         const yb = y - drop - 1; if (yb > ground) T.S.set(x, yb, z, 'minecraft:stone_brick_slab[type=top,waterlogged=false]');
       } else if (st === 'timber' || st === 'mixed') {
         // a beam under the boards; knee braces next to the piers
-        T.S.set(x, y - 1, z, edgeC ? B(`stripped_${bw}_log`, { axis: 'y' }) : B(`${bw}_slab`, { type: 'top', waterlogged: false }));
+        T.S.set(x, y - 1, z, edgeC ? B(`stripped_${bw}_log`, { axis: beamAxis(i) }) : B(`${bw}_slab`, { type: 'top', waterlogged: false }));
         if (pd === 1 && y - 2 > ground && edgeC) T.S.set(x, y - 2, z, B(`${bw}_fence`, { east: false, north: false, south: false, waterlogged: false, west: false }));
       } else if (pd === 1) T.S.set(x, y - 1, z, 'minecraft:stone_brick_slab[type=top,waterlogged=false]');
       deck.set(x + ',' + z, [y, BRIDGE_STYLES[st].rail]);
@@ -317,7 +384,16 @@ function street(T, o = {}) {
       T.setGround(x, z, y, mat(x, z, d, i));
       for (let yy = T.orig[T.idx(x, z)] + 1; yy < y; yy++) T.S.set(x, yy, z, 'minecraft:' + pickU(u(yy), [['stone_bricks', 5], ['mossy_stone_bricks', 3], ['cobblestone', 1]]));
       quayXZ.add(x + ',' + z); quay.cells++;
-    } else T.setGround(x, z, y, mat(x, z, d, i));
+    } else {
+      T.setGround(x, z, y, mat(x, z, Math.max(0, d - (localHalf - half)), i));
+      if (approachAt(i)) bridge.approachCells++;
+      if (sp && !sp.vi && (i === sp.a || i === sp.b)) {
+        // Dress the bank face as an abutment even when it already supports the deck naturally.
+        for (let yy = Math.max(T.y0, y - 4); yy < y; yy++) T.S.set(x, yy, z, PIER);
+        deck.set(x + ',' + z, [y, BRIDGE_STYLES[styleKey(sp)].rail]); onBridge.add(x + ',' + z);
+        occupied.add(x + ',' + z); bridge.abutments++;
+      }
+    }
     roadSet.set(key3(x, 0, z), y);
   }
   // parapet on every deck cell that borders open air (8-neighbourhood, so diagonal edges stay closed)
@@ -336,7 +412,7 @@ function street(T, o = {}) {
   }
   bridge.length = spans.reduce((n, sp) => n + sp.b - sp.a + 1, 0);
   bridge.piers = Math.round(bridge.piers / Math.max(1, w));
-  for (const [x, z, i, d] of blend) {
+  for (const [x, z, i, d, localHalf] of blend) {
     if (roadSet.has(key3(x, 0, z)) || occupied.has(x + ',' + z)) continue;
     if ((spanOf(i) || viaduct(x, z, i)) && T.H(x, z) < lv[i] - 1) continue;
     if (T.water[T.idx(x, z)]) continue;
@@ -351,7 +427,13 @@ function street(T, o = {}) {
       }
       continue;
     }
-    const t = (d - half) / (shoulder + 0.5), o0 = T.orig[T.idx(x, z)];
+    // Splayed, supported wing walls sit outside the carriageway; they never narrow the bridge.
+    if (approachAt(i) && d <= localHalf + 1.1 && lv[i] - orig(x, z) >= 1) {
+      for (let yy = orig(x, z) + 1; yy <= lv[i]; yy++) T.S.set(x, yy, z, 'minecraft:stone_bricks');
+      T.S.set(x, lv[i] + 1, z, B('stone_brick_slab', { type: 'bottom', waterlogged: false }));
+      occupied.add(x + ',' + z); bridge.wingWalls++; continue;
+    }
+    const t = (d - localHalf) / (shoulder + 0.5), o0 = T.orig[T.idx(x, z)];
     T.setGround(x, z, Math.round(lv[i] + (o0 - lv[i]) * t));
   }
   // low wall along the quay edge where the road meets open water
@@ -369,12 +451,15 @@ function street(T, o = {}) {
     T.S.set(x, y, z, B('stone_brick_wall', { east: c.east, north: c.north, south: c.south, up: straight ? 'false' : 'true', waterlogged: 'false', west: c.west }));
   }
   // half-step slabs where the road climbs one level, on the lower side
+  const slabSteps = [];
   if (kind.slab) for (const [x, z, i] of road) {
-    if (onBridge.has(x + ',' + z)) continue;
-    const up = (lv[i + 1] ?? lv[i]) > lv[i] || (lv[i - 1] ?? lv[i]) > lv[i];
-    const st = T.S.get(x, lv[i], z) || '', id = st.split('[')[0].replace('minecraft:', '');
-    if (up && kind.slabs[id]) T.S.set(x, lv[i] + 1, z, B(kind.slabs[id], { type: 'bottom', waterlogged: false }));
+    const y = roadSet.get(key3(x, 0, z));
+    const up = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, b]) => roadSet.get(key3(x + a, 0, z + b)) === y + 1);
+    const st = T.S.get(x, y, z) || '', id = st.split('[')[0].replace('minecraft:', '');
+    const slab = kind.slabs[id] || (onBridge.has(x + ',' + z) ? (id.endsWith('_planks') ? id.replace('_planks', '_slab') : 'stone_brick_slab') : null);
+    if (up && slab && !T.S.get(x, y + 1, z)) slabSteps.push([x, y + 1, z, B(slab, { type: 'bottom', waterlogged: false })]);
   }
+  for (const [x, y, z, st] of slabSteps) T.S.set(x, y, z, st);
   // props along the sides
   const props = { lamp: 0, tree: 0 }, placed = o.placed || new Set();
   const normal = i => { const a = cells[Math.max(0, i - 2)], b = cells[Math.min(cells.length - 1, i + 2)]; const dx = b[0] - a[0], dz = b[1] - a[1], l = Math.hypot(dx, dz) || 1; return [-dz / l, dx / l]; };
@@ -407,5 +492,5 @@ function street(T, o = {}) {
   }
   const steps = lv.reduce((n, v, i) => n + (i && v !== lv[i - 1] ? 1 : 0), 0);
   bridge.style = BRIDGE_STYLES[BS].label; bridge.viaductStyle = BRIDGE_STYLES[VS].label;
-  return { cells, levels: lv, road, props, steps, bridge, viaduct: via.cells, retain, quay: quay.cells, warnings, rise: Math.max(...lv) - Math.min(...lv), length: cells.length, width: w, kind: kind.label };
+  return { cells, levels: lv, road, props, steps, bridge, spans, landings: [...flatEdges], grading: { endEarth, landingsRelaxed: !!lv.landingsRelaxed }, slabSteps: slabSteps.length, viaduct: via.cells, retain, quay: quay.cells, warnings, rise: Math.max(...lv) - Math.min(...lv), length: cells.length, width: w, kind: kind.label };
 }

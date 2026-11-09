@@ -470,6 +470,8 @@ function townRoads(T, o) {
     report.push(`道路 ${k + 1}：${r.kind} 长 ${r.length} 格、宽 ${r.width} 格，高差 ${r.rise} 格` + (r.bridge.spans ? `，${r.bridge.style} ${r.bridge.spans} 座` : '') + (r.viaduct ? `，${r.bridge.viaductStyle}式高架 ${r.viaduct} 格` : '') + (r.warnings.length ? '；⚠ ' + r.warnings.join('；') : ''));
   }
   roundJunctions(T, o.roads, foot, roadSet, occupied, report, order);
+  // Junction landings may have adjusted the centreline; house pads and props use the final levels.
+  for (const r of roads) r.cells.forEach(([x, z], i) => { const y = roadSet.get(key3(x, 0, z)); if (y != null) r.levels[i] = y; });
   raiseKerbs(T, o.roads, foot, roadSet, report);
   const zoneItems = applyZones(T, o.zones || [], { budget, roadSet, occupied, seed, report });
   zoneItems.forEach(it => { it.zone = true; });
@@ -568,6 +570,8 @@ function townRoads(T, o) {
 // around each junction: cells within r of the road surface, whose whole r-disc stays within that band,
 // are part of the rounded shape. A narrow branch meeting a wide road flares out the same way.
 function roundJunctions(T, roads, foot, roadSet, occupied, report, order = null) {
+  const opened = openRoadJunctionRails(T, roadSet);
+  if (opened) report.push(`桥面接路：清理内部旧护栏 ${opened} 格，保留外缘护栏`);
   const K = roads.map((rd, k) => k).filter(k => foot[k]);
   const pts = [];
   for (let i = 0; i < K.length; i++) for (let j = i + 1; j < K.length; j++) {
@@ -577,11 +581,21 @@ function roundJunctions(T, roads, foot, roadSet, occupied, report, order = null)
     for (const c of small) { const [x, z] = c.split(',').map(Number); if (big.has(c) || big.has((x + 1) + ',' + z) || big.has((x - 1) + ',' + z) || big.has(x + ',' + (z + 1)) || big.has(x + ',' + (z - 1))) pts.push([x, z, r, K[i], K[j]]); }
   }
   if (!pts.length) return 0;
-  // cluster junction cells (cells within 8 of each other belong to the same junction)
-  const groups = [];
-  for (const p of pts) { let g = groups.find(g => Math.abs(g.cx - p[0]) <= 8 && Math.abs(g.cz - p[1]) <= 8); if (!g) groups.push(g = { cx: p[0], cz: p[1], x0: p[0], x1: p[0], z0: p[1], z1: p[1], r: p[2], roads: new Set() }); g.roads.add(p[3]); g.roads.add(p[4]); g.x0 = Math.min(g.x0, p[0]); g.x1 = Math.max(g.x1, p[0]); g.z0 = Math.min(g.z0, p[1]); g.z1 = Math.max(g.z1, p[1]); g.r = Math.max(g.r, p[2]); }
+  // Connected overlap patches, rather than distance to the first sample: a wide five-way junction
+  // is one platform, while two separate junctions along the same road remain separate platforms.
+  const patches = new Map(), groups = [];
+  for (const p of pts) { const key = p[0] + ',' + p[1]; if (!patches.has(key)) patches.set(key, []); patches.get(key).push(p); }
+  while (patches.size) {
+    const start = patches.values().next().value[0], g = { x0: start[0], x1: start[0], z0: start[1], z1: start[1], r: start[2], roads: new Set() }, queue = [[start[0], start[1]]];
+    for (let i = 0; i < queue.length; i++) {
+      const [x, z] = queue[i], key = x + ',' + z, list = patches.get(key); if (!list) continue; patches.delete(key);
+      for (const p of list) { g.roads.add(p[3]); g.roads.add(p[4]); g.x0 = Math.min(g.x0, x); g.x1 = Math.max(g.x1, x); g.z0 = Math.min(g.z0, z); g.z1 = Math.max(g.z1, z); g.r = Math.max(g.r, p[2]); }
+      for (let a = -2; a <= 2; a++) for (let b = -2; b <= 2; b++) if (patches.has((x + a) + ',' + (z + b))) queue.push([x + a, z + b]);
+    }
+    g.cx = (g.x0 + g.x1) / 2; g.cz = (g.z0 + g.z1) / 2; groups.push(g);
+  }
   const isRoad = (x, z) => roadSet.has(key3(x, 0, z));
-  let filled = 0;
+  let filled = 0, platforms = 0, adjusted = 0, kept = 0;
   for (const g of groups) {
     const r = g.r, R = Math.ceil(r), pad = R * 2 + 4, x0 = g.x0 - pad, x1 = g.x1 + pad, z0 = g.z0 - pad, z1 = g.z1 + pad;
     const near = (x, z, rad) => { for (let a = -Math.ceil(rad); a <= Math.ceil(rad); a++) for (let b = -Math.ceil(rad); b <= Math.ceil(rad); b++) if (a * a + b * b <= rad * rad + 0.01 && isRoad(x + a, z + b)) return true; return false; };
@@ -606,9 +620,13 @@ function roundJunctions(T, roads, foot, roadSet, occupied, report, order = null)
       add.push([x, z, lv, pave.length ? pave[(x * 7 + z * 13 & 0xff) % Math.min(2, pave.length)] : 'minecraft:cobblestone']);
     }
     for (const [x, z, lv, top] of add) { T.setGround(x, z, lv, /_slab|_stairs|_wall|fence|lantern/.test(top) ? 'minecraft:cobblestone' : top); roadSet.set(key3(x, 0, z), lv); filled++; }
+    const platform = junctionPlatform(T, roads, roadSet, g, order);
+    if (platform.ok) { platforms++; adjusted += platform.changed; } else kept++;
     redoEdges(T, roads, foot, roadSet, g, R, order, add);
   }
   if (filled) report.push(`路口：${groups.length} 处，转角铺成圆弧共 ${filled} 格`);
+  if (platforms) report.push(`路口平台：${platforms} 处，缓坡衔接调整 ${adjusted} 格`);
+  if (kept) report.push(`路口 ${kept} 处因桥面、边界或高差限制保留原有坡道`);
   return filled;
 }
 // Edged roads (kerb + drain: 规整石板主街; kerb: 砖铺街道) at a junction: each road laid its own kerbs,
