@@ -47,6 +47,8 @@ jobs:
         run: node web/test/project-plaza-facade.cjs
       - name: 批量删除、树木恢复与撤销重做回归
         run: node web/test/batch-delete.cjs
+      - name: 单对象移动碰撞、重建与树木回归
+        run: node web/test/single-object-worker.cjs
       - name: 道路、桥头和路口边界回归
         run: |
           node web/test/road-design.cjs > road-design-tests.json
