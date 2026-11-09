@@ -2,6 +2,15 @@
 
 ## Project restoration, facade and plaza editing
 
+`node web/test/batch-delete.cjs` exercises the actual viewer batch-delete and
+history commands with the real generator. Batch deletion and its undo/redo use
+full composition, matching project reopen: trees present in the saved ground can
+return, explicit greenery clear layers still apply, and unselected placed trees
+remain. Single-object editing continues to use its existing incremental path.
+`node web/test/batch-delete-browser.cjs` additionally covers real worker/sync
+commands, selective deletion, tree clearing overlays, project reopen and actual
+schematic downloads. It uses the same optional Playwright/browser variables below.
+
 After `python build_viewer.py`, run `node web/test/project-plaza-facade.cjs`.
 This checks returned cathedral specs, incremental well edits versus a full rebuild,
 and real collisions with roads, houses and another well. Set `MCGEN_BASELINE` to
