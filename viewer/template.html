@@ -2729,7 +2729,7 @@ function runTown(after, live) {
   GW.call('town', 'townGen', { base: { W: base.W, H: base.H, L: base.L, palette: base.palette, data: base.data }, region, args, ver, baseTag: baseTagOf(base), green: greenArgs() }, 'coalesce').then(r => {
     if (!r || ver !== TOWN_VER) return;               // replaced by a newer request
     const label = `街区 · 种子 ${$('t_seed').value}`;
-    TOWN = { remote: true, cstate: 'remote', ver, region, geo: base.geo || null, label, scene: townMirror(r.mirror), boxes: new Map(r.boxes), report: r.report, suppress };
+    TOWN = { remote: true, cstate: 'remote', layoutMode: 'town', ver, region, geo: base.geo || null, label, scene: townMirror(r.mirror), boxes: new Map(r.boxes), report: r.report, suppress };
     window.PENDING_SUPPRESS = null;
     if (!live) SEL = null;
     showTerrainModel(r.model, base.geo || null, label, (region ? [`选区 ${region[2] - region[0] + 1}×${region[3] - region[1] + 1}`] : []).concat(r.report), el, t0, live ? '实时预览' : '完成');
@@ -2760,7 +2760,7 @@ function runTownSync(after) {
       const r0 = MCGen.town(T, { keep, zones, suppress, seed: +$('t_seed').value || 1, budget: { cut: +$('t_cut').value, fill: +$('t_fill').value }, streetWidth: +$('t_width').value, square: $('t_square').checked, palette: $('t_palette').value, roads, slant: $('t_slant').checked });
       const C = MCGen.composeTown(r0.scene), r = r0; work.blocks = C.T.S.blocks;
       const label = `街区 · 种子 ${$('t_seed').value}`;
-      TOWN = { S0: { blocks: new Map(S.blocks), box: S.box.map(v => v.slice()) }, region, geo, label, scene: r.scene, boxes: null, report: r.report, suppress };
+      TOWN = { S0: { blocks: new Map(S.blocks), box: S.box.map(v => v.slice()) }, layoutMode: 'town', region, geo, label, scene: r.scene, boxes: null, report: r.report, suppress };
       window.PENDING_SUPPRESS = null;
       SEL = null;
       if (region) {   // put the generated block back into the whole terrain
@@ -4737,7 +4737,7 @@ function ensureTown() {
   if (townActive()) return true;
   const base = baseModel(); if (!base) { $('t_status').textContent = '先在"地形"里选择或导入地形。'; return false; }
   const S = modelToStructure(base), T = new MCGen.Terrain(S);
-  TOWN = { S0: { blocks: new Map(S.blocks), box: S.box.map(v => v.slice()) }, region: null, geo: base.geo || null, label: '街区 · 手动布置', scene: MCGen.emptyScene(T, { cut: +$('t_cut').value, fill: +$('t_fill').value }), boxes: new Map() };
+  TOWN = { S0: { blocks: new Map(S.blocks), box: S.box.map(v => v.slice()) }, layoutMode: 'manual', region: null, geo: base.geo || null, label: '街区 · 手动布置', scene: MCGen.emptyScene(T, { cut: +$('t_cut').value, fill: +$('t_fill').value }), boxes: new Map() };
   TOWN.model = null;
   if (GW.ok) { TOWN.remote = true; TOWN.cstate = 'remote'; TOWN.ver = ++TOWN_VER; GW.call('town', 'townEmpty', { ver: TOWN.ver, base: { W: base.W, H: base.H, L: base.L, palette: base.palette, data: base.data }, budget: { cut: +$('t_cut').value, fill: +$('t_fill').value }, green: greenArgs() }, true); }
   return true;
@@ -4808,7 +4808,14 @@ function projectJSON() {
     ? { src: 'import', name: TER.imported.tname, model: { W: TER.imported.W, H: TER.imported.H, L: TER.imported.L, palette: TER.imported.palette, data: b64e(new Uint8Array(Uint32Array.from(TER.imported.data).buffer)), geo: TER.imported.geo || null } }
     : { src: 'default', synth: TER.synth };
   const params = {}; T_PARAMS.forEach(id => { const el = $(id); params[id] = el.type === 'checkbox' ? el.checked : el.value; });
-  return { app: 'mc-house-generator', kind: 'project', v: 1, saved: new Date().toISOString(), gameVersion: GVER, green: greenSave(), terrain: terr, roads: picks.roads, zones: picks.zones, region: picks.region, useRegion: $('t_useregion').checked, params, items: TOWN && TOWN.scene ? TOWN.scene.items : [], suppress: TOWN && TOWN.suppress || [] };
+  return { app: 'mc-house-generator', kind: 'project', v: 1, saved: new Date().toISOString(), layoutMode: TOWN && TOWN.layoutMode || 'manual', gameVersion: GVER, green: greenSave(), terrain: terr, roads: picks.roads, zones: picks.zones, region: picks.region, useRegion: $('t_useregion').checked, params, items: TOWN && TOWN.scene ? TOWN.scene.items : [], suppress: TOWN && TOWN.suppress || [] };
+}
+function projectLayoutMode(P) {
+  if (P.layoutMode === 'manual' || P.layoutMode === 'town') return P.layoutMode;
+  // Legacy projects did not record the generation mode. Generated items keep
+  // their auto/road/zone provenance even after being moved manually.
+  return !Array.isArray(P.items) || (P.roads || []).length || (P.zones || []).length ||
+    (P.suppress || []).length || P.items.some(it => it.auto || it.road != null || it.zone) ? 'town' : 'manual';
 }
 $('proj_save').addEventListener('click', async () => {
   const json = new TextEncoder().encode(JSON.stringify(projectJSON())), base = 'mc-town-' + new Date().toISOString().slice(0, 10);
@@ -4851,8 +4858,15 @@ $('proj_file').addEventListener('change', async e => {
     greenLoadProject(P.green);
     picks.roads = P.roads || []; picks.zones = P.zones || []; picks.region = P.region || []; $('t_useregion').checked = !!P.useRegion;
     renderRoads(); renderZones(); pickInfo(); TOWN = null; window.PENDING_SUPPRESS = P.suppress || [];
-    // regenerate the ground layer (deterministic), then put back exactly the saved items
-    runTown(() => { if (P.items && P.items.length) { TOWN.scene.items = P.items; TOWN.scene.nextId = Math.max(0, ...P.items.map(i => i.id || 0)) + 1; SEL = null; recompose(`已打开工程 ${f.name}（${P.items.length} 个组件）`); } });
+    const restoreItems = () => {
+      if (Array.isArray(P.items)) { TOWN.scene.items = P.items; TOWN.scene.nextId = P.items.reduce((n, it) => Math.max(n, it.id || 0), 0) + 1; }
+      TOWN.suppress = P.suppress || []; window.PENDING_SUPPRESS = null; SEL = null;
+      recompose(`已打开工程 ${f.name}（${TOWN.scene.items.length} 个组件）`);
+    };
+    // Manual scenes start from the untouched terrain, while generated towns
+    // rebuild their road/plaza ground layer. An empty item list is intentional.
+    if (projectLayoutMode(P) === 'manual') { if (ensureTown()) restoreItems(); }
+    else runTown(restoreItems);
   } catch (err) { tStatus('打开工程失败：' + err.message, true); console.error(err); }
 });
 $('layerbtn').addEventListener('click', e => { $('layerpop').hidden = !$('layerpop').hidden; e.stopPropagation(); });

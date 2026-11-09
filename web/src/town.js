@@ -29,7 +29,7 @@ function town(T, o = {}) {
   const seed = o.seed || 1, rng = new PyRandom(deriveSeed(seed, 'town'));
   const budget = { cut: o.budget?.cut ?? 3, fill: o.budget?.fill ?? 3 };
   const width = o.streetWidth || 5, half = (width - 1) / 2, depth = o.plotDepth || 17;
-  const report = [], placed = new Set(), occupied = new Set(), roadSet = new Map();
+  const report = [], placed = new Set(), occupied = new Set(), roadSet = new Map(), plaza = new Set();
   const st = chooseStreet(T, width, depth + 2);
   const along = st.axis === 'x' ? 0 : 1;                 // index into [x, z] that runs along the street
   const cAt = st.c + (st.axis === 'x' ? T.z0 : T.x0);
@@ -64,7 +64,7 @@ function town(T, o = {}) {
         const ring = Math.max(Math.abs(a - (sq.a0 + (sqLen >> 1))), Math.abs(k - (sqDepth >> 1)));
         const u = patchNoise(x, 0, z, deriveSeed(seed, 'square'), 'sq', 2);
         T.setGround(x, z, sq.lvl, ring % 3 === 0 ? 'minecraft:stone_bricks' : 'minecraft:' + pickU(u, pave));
-        occupied.add(x + ',' + z); roadSet.set(key3(x, 0, z), sq.lvl);
+        occupied.add(x + ',' + z); roadSet.set(key3(x, 0, z), sq.lvl); plaza.add(x + ',' + z);
       }
       // blend the square's edges into the slope
       for (let a = sq.a0 - 2; a < sq.a0 + sqLen + 2; a++) for (let k = -0; k < sqDepth + 2; k++) {
@@ -88,10 +88,10 @@ function town(T, o = {}) {
   }
 
   // ---- ground layer is done: everything from here on is a movable item ----
-  const zoneItems = applyZones(T, o.zones || [], { budget, roadSet, occupied, seed, report });
+  const zoneItems = applyZones(T, o.zones || [], { budget, roadSet, occupied, plaza, seed, report });
   const ground = cloneTerrain(T), occ0 = new Set(occupied);
   for (const r of o.suppress || []) for (let x = r[0]; x <= r[2]; x++) for (let z = r[1]; z <= r[3]; z++) occupied.add(x + ',' + z);
-  const ctx = { budget, roadSet, occupied, placed, strict: true }; T.protect = placed;
+  const ctx = { budget, roadSet, occupied, placed, plaza, strict: true }; T.protect = placed;
   const items = [];
   const add = it => { const r = placeItem(T, it, ctx); if (r.ok) items.push(it); return r; };
   sqItems.forEach(add); zoneItems.forEach(add); keepItems(T, o.keep, ctx, items);
@@ -144,7 +144,7 @@ function town(T, o = {}) {
   report.push(`土方：挖 ${e.cut} 格、填 ${e.fill} 格；最大挖深 ${e.maxCut}、最大填高 ${e.maxFill}（预算 ${budget.cut} / ${budget.fill}）；改动了 ${(e.share * 100).toFixed(1)}% 的地面`);
   report.push(chk.total ? `放置检查：${chk.total} 处问题 ${JSON.stringify(chk.issues)}` : '放置检查：通过');
   items.forEach((it, i) => { it.id = i + 1; if (!it.manual) it.auto = true; });
-  return { report, earth: e, check: chk, houses, street: st, square: sq, scene: { ground, occ0, roadSet, budget, items, nextId: items.length + 1 } };
+  return { report, earth: e, check: chk, houses, street: st, square: sq, scene: { ground, occ0, roadSet, plaza, budget, items, nextId: items.length + 1 } };
 }
 
 // one plot -> a house item (spec, centre, facing); placement decides the pad
@@ -204,12 +204,23 @@ function placeItem(T, it, ctx) {
     const x = Math.round(it.x), z = Math.round(it.z);
     if (!T.inside(x, z)) return { ok: false };
     if (ctx.strict && T.water[T.idx(x, z)]) return { ok: false };
-    const clash = occupied.has(x + ',' + z) || roadSet.has(key3(x, 0, z)) ? 1 : 0;
+    let clash = occupied.has(x + ',' + z) || roadSet.has(key3(x, 0, z)) ? 1 : 0;
     const prop = it.type === 'lamp' ? lampPost({ style: it.style, height: it.height || 3, seed: it.seed, wood: it.wood, stone: it.stone, soul: it.soul })
       : it.type === 'well' ? well({ style: it.style || 'roof', seed: it.seed })
       : tree({ species: it.species || 'oak', size: it.size || 'm', seed: it.seed || 1 });
     if (it.type === 'tree' && !roadSet.has(key3(x, 0, z))) T.setGround(x, z, T.H(x, z), 'minecraft:grass_block[snowy=false]');
     const y = T.H(x, z) + 1, blocks = rotQuarter(prop.S.blocks, it.q || 0);
+    // A plaza is a support surface for a well, not an obstacle. Keep actual
+    // component collisions and occupied cells outside the plaza protected.
+    if (it.type === 'well' && ctx.plaza && ctx.plaza.has(x + ',' + z)) {
+      clash = 0;
+      for (const [k, st] of blocks) {
+        if (isAir(st)) continue;
+        const [a, yy, c] = unkey(k), gx = x + a, gz = z + c, key = key3(gx, y + yy, gz);
+        if (!T.inside(gx, gz) || (placed.has(key) && !isAir(T.S.get(gx, y + yy, gz))) ||
+            (!ctx.plaza.has(gx + ',' + gz) && (occupied.has(gx + ',' + gz) || roadSet.has(key3(gx, 0, gz))))) clash++;
+      }
+    }
     let b = [[Infinity, Infinity, Infinity], [-Infinity, -Infinity, -Infinity]];
     for (const [k, st] of blocks) {
       const [a, yy, c] = unkey(k), kk = key3(x + a, y + yy, z + c);
@@ -417,7 +428,7 @@ function noteResult(st, it, r, warn, clashes) {
 function composeTown(scene) {
   const T = cloneTerrain(scene.ground); journalTerrain(T);
   const placed = new JSet(), occupied = new JSet(scene.occ0);
-  const ctx = { budget: scene.budget, roadSet: scene.roadSet, occupied, placed, strict: false }; T.protect = placed;
+  const ctx = { budget: scene.budget, roadSet: scene.roadSet, occupied, placed, plaza: scene.plaza, strict: false }; T.protect = placed;
   const st = { T, ctx, J: new Map(), boxes: new Map(), occ0: scene.occ0, seq: [] };
   const warn = [], clashes = [];
   const rank = t => LANDMARK_PLACE[t] ? -1 : t === 'house' || t === 'struct' ? 0 : t === 'well' ? 1 : t === 'lamp' ? 2 : 3;
@@ -454,7 +465,7 @@ const along0 = (P, x, z) => { const t = P(1, 0); return t[0] ? x : z; };
 function townRoads(T, o) {
   const seed = o.seed || 1, rng = new PyRandom(deriveSeed(seed, 'town-roads'));
   const budget = { cut: o.budget?.cut ?? 3, fill: o.budget?.fill ?? 3 };
-  const report = [], placed = new Set(), occupied = new Set(), roadSet = new Map(), roads = [];
+  const report = [], placed = new Set(), occupied = new Set(), roadSet = new Map(), plaza = new Set(), roads = [];
   // wider / paved roads first, so their surface runs straight through a junction (the narrower road
   // stops at its edge); roads keep their own index k for numbering and item ownership
   const PRI = { main: 5, brick: 4, cobble: 3, gravel: 2, plank: 1, lane: 0 };
@@ -473,7 +484,7 @@ function townRoads(T, o) {
   // Junction landings may have adjusted the centreline; house pads and props use the final levels.
   for (const r of roads) r.cells.forEach(([x, z], i) => { const y = roadSet.get(key3(x, 0, z)); if (y != null) r.levels[i] = y; });
   raiseKerbs(T, o.roads, foot, roadSet, report);
-  const zoneItems = applyZones(T, o.zones || [], { budget, roadSet, occupied, seed, report });
+  const zoneItems = applyZones(T, o.zones || [], { budget, roadSet, occupied, plaza, seed, report });
   zoneItems.forEach(it => { it.zone = true; });
   // o.region = [x0, z0, x1, z1]: generate automatic items only inside it (the area around roads that
   // changed); o.fixed = the previous automatic items outside it, put back exactly as they were
@@ -483,7 +494,7 @@ function townRoads(T, o) {
   let curArea = null; const inR = (x, z) => inR0(x, z) && (!curArea || curArea.has(Math.round(x), Math.round(z)));
   const ground = cloneTerrain(T), occ0 = new Set(occupied);
   for (const r of o.suppress || []) for (let x = r[0]; x <= r[2]; x++) for (let z = r[1]; z <= r[3]; z++) occupied.add(x + ',' + z);
-  const ctx = { budget, roadSet, occupied, placed, strict: true }, items = []; T.protect = placed;
+  const ctx = { budget, roadSet, occupied, placed, plaza, strict: true }, items = []; T.protect = placed;
   const add = it => { const r = placeItem(T, it, ctx); if (r.ok) items.push(it); return r; };
   zoneItems.forEach(add);
   // previous items of the roads that did not change: put back, but strictly — one the new route now runs over is dropped
@@ -560,7 +571,7 @@ function townRoads(T, o) {
   report.push(`土方：挖 ${e.cut} 格、填 ${e.fill} 格；最大挖深 ${e.maxCut}、最大填高 ${e.maxFill}（预算 ${budget.cut} / ${budget.fill}）`);
   report.push(chk.total ? `放置检查：${chk.total} 处问题 ${JSON.stringify(chk.issues)}` : '放置检查：通过');
   items.forEach((it, i) => { it.id = i + 1; if (!it.manual) it.auto = true; });
-  return { report, earth: e, check: chk, houses, scene: { ground, occ0, roadSet, budget, items, nextId: items.length + 1 } };
+  return { report, earth: e, check: chk, houses, scene: { ground, occ0, roadSet, plaza, budget, items, nextId: items.length + 1 } };
 }
 
 // Things the user placed or changed by hand survive a regeneration: they go in first (wherever
@@ -718,6 +729,7 @@ function applyZones(T, zones, c) {
       const ring = Math.max(Math.abs(Math.round(x - cx)), Math.abs(Math.round(z - cz))), u = patchNoise(x, 0, z, deriveSeed(c.seed + k, 'plaza'), 'pz', 2);
       T.setGround(x, z, lvl, ring % 3 === 0 ? 'minecraft:stone_bricks' : 'minecraft:' + pickU(u, pave));
       c.occupied.add(x + ',' + z); c.roadSet.set(key3(x, 0, z), lvl);
+      if (c.plaza) c.plaza.add(x + ',' + z);
     }
     for (let x = x0 - 3; x <= x1 + 3; x++) for (let z = z0 - 3; z <= z1 + 3; z++) {
       if (!T.inside(x, z) || c.occupied.has(x + ',' + z) || c.roadSet.has(key3(x, 0, z))) continue;
