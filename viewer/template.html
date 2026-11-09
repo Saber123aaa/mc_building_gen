@@ -4026,13 +4026,20 @@ function bselEnd() {
 }
 function deleteSel() {
   const its = selItems(); if (!its.length) return;
+  const fullCompose = its.length > 1;
+  if (fullCompose && TOWN_GEN_PENDING) { tStatus('街区正在重新生成，请等生成完成后再编辑。', true); return; }
   pushHist();
+  if (fullCompose) HIST[HIST.length - 1].fullCompose = true;
   // deleting something the generator placed: keep the generator from putting it back there
   TOWN.suppress = TOWN.suppress || [];
   for (const it of its) if (!it.manual) { const b = TOWN.boxes.get(it.id); if (b) TOWN.suppress.push([b[0][0], b[0][2], b[1][0], b[1][2]]); }
   const ids = its.map(i => i.id);
   TOWN.scene.items = TOWN.scene.items.filter(x => !ids.includes(x.id)); SEL = null;
-  retouch(ids, its.length > 1 ? `删除了 ${its.length} 个组件` : `删除了 ${TYPE_CN[its[0].type]} #${its[0].id}`);
+  const what = its.length > 1 ? `删除了 ${its.length} 个组件` : `删除了 ${TYPE_CN[its[0].type]} #${its[0].id}`;
+  // Rebuild from the saved ground and surviving items. The incremental journal
+  // cannot unwind a batch with shared ground/blocks reliably. This also follows
+  // the same natural-tree restoration and greenery rules as opening a project.
+  if (fullCompose) recompose(what); else retouch(ids, what);
 }
 // copies land next to the originals: try right, below, left, above until the group fits
 function duplicateSel() {
@@ -4345,7 +4352,7 @@ function restore(sn) {
   const before = new Map(TOWN.scene.items.map(i => [i.id, JSON.stringify(i)])), after = new Map(sn.items.map(i => [i.id, JSON.stringify(i)]));
   const changed = [...new Set([...before.keys(), ...after.keys()])].filter(id => before.get(id) !== after.get(id));
   TOWN.scene.items = sn.items; TOWN.suppress = sn.suppress || []; if (SEL && !selItem()) SEL = null;
-  retouch(changed, '撤销 / 重做');
+  if (sn.fullCompose) recompose('撤销 / 重做'); else retouch(changed, '撤销 / 重做');
 }
 // 道路编辑的撤销: a snapshot of the road layers goes onto the same layout undo stack as component edits.
 // Edits arriving within 800 ms of each other on the same field (typing a number) count as one step.
@@ -4363,8 +4370,8 @@ function restoreRoads(sn) {
   clearTimeout(roadEditT); if (TOWN) runTown();
 }
 function pushHist() { const sn = snapshot(); if (!sn) return; HIST.push(sn); if (HIST.length > 50) HIST.shift(); REDO.length = 0; }
-function undoHist() { const sn = HIST.pop(); if (!sn) { renderSel(); return; } const cur = sn.kind === 'roads' ? roadSnap() : sn.kind === 'green' ? greenSnap() : snapshot(); if (!cur) { renderSel(); return; } REDO.push(cur); sn.kind === 'roads' ? restoreRoads(sn) : sn.kind === 'green' ? greenRestore(sn) : restore(sn); renderSel(); }
-function redoHist() { const sn = REDO.pop(); if (!sn) { renderSel(); return; } const cur = sn.kind === 'roads' ? roadSnap() : sn.kind === 'green' ? greenSnap() : snapshot(); if (!cur) { renderSel(); return; } HIST.push(cur); sn.kind === 'roads' ? restoreRoads(sn) : sn.kind === 'green' ? greenRestore(sn) : restore(sn); renderSel(); }
+function undoHist() { const sn = HIST.pop(); if (!sn) { renderSel(); return; } const cur = sn.kind === 'roads' ? roadSnap() : sn.kind === 'green' ? greenSnap() : snapshot(); if (!cur) { renderSel(); return; } if (sn.fullCompose) cur.fullCompose = true; REDO.push(cur); sn.kind === 'roads' ? restoreRoads(sn) : sn.kind === 'green' ? greenRestore(sn) : restore(sn); renderSel(); }
+function redoHist() { const sn = REDO.pop(); if (!sn) { renderSel(); return; } const cur = sn.kind === 'roads' ? roadSnap() : sn.kind === 'green' ? greenSnap() : snapshot(); if (!cur) { renderSel(); return; } if (sn.fullCompose) cur.fullCompose = true; HIST.push(cur); sn.kind === 'roads' ? restoreRoads(sn) : sn.kind === 'green' ? greenRestore(sn) : restore(sn); renderSel(); }
 // ---- layout roads: each finished stroke / point path becomes a road in the list
 // a road end within reach of another road snaps onto that road's centreline, so the two connect
 function snapToRoads(pt, skip) {
