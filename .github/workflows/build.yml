@@ -28,16 +28,30 @@ jobs:
           python web/test/py_run.py
           node web/test/js_run.js | tee js_run.log
           grep -q " bad 0 " js_run.log
-      - name: 主教座堂四种风格冒烟测试
+      - name: 主教座堂十种风格冒烟测试
         run: |
           node -e "
           const M = require('./web/mcgen.js');
-          for (const style of ['french', 'german', 'italian', 'spanish']) {
+          for (const style of ['french', 'german', 'italian', 'spanish', 'english', 'romanesque', 'brick_gothic', 'byzantine', 'baroque', 'renaissance']) {
             const r = M.cathedral({ style });
             const c = M.checkPlacement(r.S);
-            console.log(style, r.S.blocks.size, 'issues', c.total, 'adjust', r.adjust.length);
-            if (c.total || r.adjust.length) process.exit(1);
+            console.log(style, r.S.blocks.size, 'issues', c.total, 'adjust', (r.adjust || []).length);
+            if (c.total || (r.adjust || []).length) process.exit(1);
           }"
+      - name: 巴洛克入口、布局编辑与 Python 回归
+        run: |
+          node web/test/baroque.js
+          node web/test/baroque-town.js
+          python -X utf8 web/test/baroque_python.py
+      - name: 道路、桥头和路口边界回归
+        run: |
+          node web/test/road-design.cjs > road-design-tests.json
+          node -e "const r = require('./road-design-tests.json'); console.log('Road cases', r.visualCases, 'matrix', r.matrixCases, 'invalid', r.invalidCases, 'hairpins', r.hairpins);"
+      - name: 保存道路测试记录
+        uses: actions/upload-artifact@v4
+        with:
+          name: road-design-tests
+          path: road-design-tests.json
       - name: 保存生成的页面（PR 里可下载试用）
         uses: actions/upload-artifact@v4
         with:
