@@ -6,10 +6,19 @@
 history commands with the real generator. Batch deletion and its undo/redo use
 full composition, matching project reopen: trees present in the saved ground can
 return, explicit greenery clear layers still apply, and unselected placed trees
-remain. Single-object editing continues to use its existing incremental path.
+remain. Single deletion uses the same rebuild and tagged undo/redo snapshots.
 `node web/test/batch-delete-browser.cjs` additionally covers real worker/sync
 commands, selective deletion, tree clearing overlays, project reopen and actual
 schematic downloads. It uses the same optional Playwright/browser variables below.
+
+`node web/test/single-object-worker.cjs` checks single horizontal movement through
+the actual worker handler: incremental collision checks decide acceptance before
+rebuilding from saved ground. Both composition orders, missing state, tree clearing
+and the default incremental path are covered. `node web/test/single-object-browser.cjs`
+checks worker/sync movement and deletion, queued key repeats at collision boundaries,
+queued undo/redo, real houses and a large Baroque cathedral, project reopen and
+schematic exports. Movement, deletion and their history intents run in order;
+other generator parameters and ordinary incremental edit calls are unchanged.
 
 After `python build_viewer.py`, run `node web/test/project-plaza-facade.cjs`.
 This checks returned cathedral specs, incremental well edits versus a full rebuild,

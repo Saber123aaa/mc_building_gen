@@ -2572,8 +2572,9 @@ function genWorkerMain() {
       gUpdate(c.T, null); const m = fullModel(c.T);
       return out(m, { boxes: [...c.boxes], warn: c.warn, check: { total: c.check.total }, earth: c.earth, reverted });
     },
-    townRetouch({ items, nextId, ids, fallback, guards, curH, ver }) {
+    townRetouch({ items, nextId, ids, fallback, guards, curH, ver, rebuildAfter = false }) {
       if (!TW || TW.ver !== ver) return { res: { stale: true } };
+      if (!TW.cstate && rebuildAfter) TW.cstate = M.composeTown({ ...TW.scene, items: fallback || TW.scene.items }).state;
       if (!TW.cstate) return H.townCompose({ items, nextId, fallback, guards, ver });
       const sc = TW.scene; sc.items = items; sc.nextId = nextId;
       let r = M.retouchTown(TW.cstate, sc, ids), reverted = false;
@@ -2581,6 +2582,14 @@ function genWorkerMain() {
         sc.items = fallback; const r1 = r; r = M.retouchTown(TW.cstate, sc, ids); reverted = true;
         if (r1.rect && r.rect) r.rect = [Math.min(r1.rect[0], r.rect[0]), Math.min(r1.rect[1], r.rect[1]), Math.max(r1.rect[2], r.rect[2]), Math.max(r1.rect[3], r.rect[3])]; else r.rect = r.rect || r1.rect;
         r.maxY = Math.max(r.maxY, r1.maxY);
+      }
+      // Keep the incremental collision decision, then rebuild the accepted (or
+      // rolled-back) scene in this same job. Never re-check only the moving id
+      // against composition order: its collision may be reported on a neighbour.
+      if (rebuildAfter) {
+        const c = M.composeTown(sc); TW.cstate = c.state; TW.boxes = c.boxes;
+        gUpdate(c.T, null);
+        return out(fullModel(c.T), { boxes: [...c.boxes], warn: c.warn, check: { total: c.check.total }, earth: c.earth, reverted });
       }
       TW.boxes = r.boxes;
       const extra = { boxes: [...r.boxes], warn: r.warn, check: { total: r.check.total }, earth: r.earth, reverted };
@@ -3883,11 +3892,34 @@ function liftSel(n) {
   for (const it of its) { it.lift = Math.max(-8, Math.min(12, (it.lift | 0) + n)); it.manual = true; }
   retouch(its.map(i => i.id), `${its.length > 1 ? its.length + ' 个组件' : '#' + its[0].id} ${n > 0 ? '升高' : '降低'} ${Math.abs(n)} 格（现为 ${its[0].lift >= 0 ? '+' : ''}${its[0].lift}）`, its.map(i => i.id));
 }
+// Serialize movement/deletion/history intents before changing items or history.
+// A queued key repeat must start from the last accepted position, not from an
+// optimistic position which an earlier collision response may still roll back.
+function townCommand(action) {
+  const town = TOWN; if (!town) return action();
+  return new Promise((resolve, reject) => {
+    const done = () => { town.editPending = false; const next = town.commandQueue.shift(); if (next) next(); };
+    const run = () => {
+      if (TOWN !== town || !townActive()) { resolve(); done(); return; }
+      town.editPending = true;
+      let result; try { result = action(); } catch (e) { reject(e); done(); return; }
+      Promise.resolve(result).then(resolve, reject).finally(done);
+    };
+    town.commandQueue = town.commandQueue || [];
+    if (town.editPending) town.commandQueue.push(run); else run();
+  });
+}
 function moveSel(dx, dz) {
-  const its = selItems(); if (!its.length) return;
-  pushHist();
-  for (const it of its) { if (BIG(it.type)) { it.cx += dx; it.cz += dz; it.level = null; } else { it.x += dx; it.z += dz; } it.manual = true; }
-  retouch(its.map(i => i.id), its.length > 1 ? `移动了 ${its.length} 个组件` : `移动了 #${its[0].id}`, its.map(i => i.id));
+  const ids = selItems().map(i => i.id); if (!ids.length) return;
+  return townCommand(() => {
+    const its = TOWN.scene.items.filter(i => ids.includes(i.id)); if (!its.length) return;
+    const rebuildAfter = its.length === 1;
+    if (rebuildAfter && TOWN_GEN_PENDING) { tStatus('街区正在重新生成，请等生成完成后再编辑。', true); return; }
+    pushHist();
+    if (rebuildAfter) HIST[HIST.length - 1].fullCompose = true;
+    for (const it of its) { if (BIG(it.type)) { it.cx += dx; it.cz += dz; it.level = null; } else { it.x += dx; it.z += dz; } it.manual = true; }
+    return retouch(its.map(i => i.id), its.length > 1 ? `移动了 ${its.length} 个组件` : `移动了 #${its[0].id}`, its.map(i => i.id), rebuildAfter);
+  });
 }
 // redo only the given items (their blocks, ground and the mesh chunks they touch)
 function townDone(r, what, t0, note) {
@@ -3895,11 +3927,11 @@ function townDone(r, what, t0, note) {
   return lines;
 }
 // an edit on the worker's town: send the current items, get back the changed region (or a full model)
-function townEdit(fn, ids, what, guardId) {
+function townEdit(fn, ids, what, guardId, rebuildAfter = false) {
   const T0 = TOWN, t0 = performance.now(), guards = guardId == null ? [] : [].concat(guardId);
   if (TOWN_GEN_PENDING && fn !== 'townCompose') { tStatus('街区正在重新生成，请等生成完成后再编辑。', true); if (guardId != null && HIST.length && HIST[HIST.length - 1].town === TOWN) { const back = HIST.pop(); TOWN.scene.items = back.items; } renderSel(); return; }
   const fallback = guards.length && HIST.length && HIST[HIST.length - 1].town === TOWN ? HIST[HIST.length - 1].items : null;
-  GW.call('town', fn, { items: JSON.parse(JSON.stringify(TOWN.scene.items)), nextId: TOWN.scene.nextId, ids, fallback, guards, curH: model ? model.H : 0, ver: TOWN.ver }, true).then(r => {
+  return GW.call('town', fn, { items: JSON.parse(JSON.stringify(TOWN.scene.items)), nextId: TOWN.scene.nextId, ids, fallback, guards, curH: model ? model.H : 0, ver: TOWN.ver, rebuildAfter }, true).then(r => {
     if (!r || r.stale || TOWN !== T0) return;
     if (r.reverted) { const back = HIST.pop(); TOWN.scene.items = back.items; TOWN.suppress = back.suppress || TOWN.suppress; if (SEL && !selItem()) SEL = null; what = '⚠ 不能和其他组件、道路或广场重叠，已取消这次操作'; }
     TOWN.boxes = new Map(r.boxes);
@@ -3909,12 +3941,16 @@ function townEdit(fn, ids, what, guardId) {
       const tp = performance.now(), n = r.sub && model && model.H === r.sub.H ? patchSub(r.sub) : 0;
       el.classList.remove('bad'); el.textContent = `完成（后台线程 ${Math.round(tp - t0)} 毫秒；重建 ${n} 个区块 ${Math.round(performance.now() - tp)} 毫秒）。` + warnFirst(lines).join('；');
     }
-    renderSel(); redraw();
+    renderSel(); redraw(); return r;
   }).catch(e => { tStatus('编辑失败：' + e.message, true); console.error(e); });
 }
-function retouch(ids, what, guardId) {
-  if (TOWN && TOWN.remote) { if (!townActive() || !model || !bufs.chunks) return recompose(what, guardId); return townEdit('townRetouch', ids, what, guardId); }
-  if (!TOWN || !TOWN.cstate || !townActive() || !model || !bufs.chunks) return recompose(what, guardId);
+function retouch(ids, what, guardId, rebuildAfter = false) {
+  if (TOWN && TOWN.remote) { if (!rebuildAfter && (!townActive() || !model || !bufs.chunks)) return recompose(what, guardId); return townEdit('townRetouch', ids, what, guardId, rebuildAfter); }
+  if (rebuildAfter && TOWN && !TOWN.cstate) {
+    const back = HIST.length && HIST[HIST.length - 1].town === TOWN ? HIST[HIST.length - 1].items : TOWN.scene.items;
+    TOWN.cstate = MCGen.composeTown({ ...TOWN.scene, items: back }).state;
+  }
+  if (!TOWN || !TOWN.cstate || !townActive() || !model || (!rebuildAfter && !bufs.chunks)) return recompose(what, guardId);
   const t0 = performance.now(); let r;
   try { r = MCGen.retouchTown(TOWN.cstate, TOWN.scene, ids); } catch (e) { console.error(e); return recompose(what, guardId); }
   const guards = guardId == null ? [] : [].concat(guardId);
@@ -3924,6 +3960,7 @@ function retouch(ids, what, guardId) {
     if (r1.rect && r.rect) r.rect = [Math.min(r1.rect[0], r.rect[0]), Math.min(r1.rect[1], r.rect[1]), Math.max(r1.rect[2], r.rect[2]), Math.max(r1.rect[3], r.rect[3])]; else r.rect = r.rect || r1.rect;
     r.maxY = Math.max(r.maxY, r1.maxY); what = '⚠ 不能和其他组件、道路或广场重叠，已取消这次操作';
   }
+  if (rebuildAfter) return recompose(what);
   TOWN.boxes = r.boxes;
   let rect = r.rect;
   if (rect && greenOn()) { if (!TOWN.OV) return recompose(what); const g = MCGen.greenOverlay(r.T, greenLayersAll(), rect, TOWN.OV); TOWN.OVY = g.maxY; if (g.clip) rect = [Math.min(rect[0], g.clip[0]), Math.min(rect[1], g.clip[1]), Math.max(rect[2], g.clip[2]), Math.max(rect[3], g.clip[3])]; }
@@ -4025,21 +4062,22 @@ function bselEnd() {
   renderSel(); redraw();
 }
 function deleteSel() {
-  const its = selItems(); if (!its.length) return;
-  const fullCompose = its.length > 1;
-  if (fullCompose && TOWN_GEN_PENDING) { tStatus('街区正在重新生成，请等生成完成后再编辑。', true); return; }
-  pushHist();
-  if (fullCompose) HIST[HIST.length - 1].fullCompose = true;
-  // deleting something the generator placed: keep the generator from putting it back there
-  TOWN.suppress = TOWN.suppress || [];
-  for (const it of its) if (!it.manual) { const b = TOWN.boxes.get(it.id); if (b) TOWN.suppress.push([b[0][0], b[0][2], b[1][0], b[1][2]]); }
-  const ids = its.map(i => i.id);
-  TOWN.scene.items = TOWN.scene.items.filter(x => !ids.includes(x.id)); SEL = null;
-  const what = its.length > 1 ? `删除了 ${its.length} 个组件` : `删除了 ${TYPE_CN[its[0].type]} #${its[0].id}`;
-  // Rebuild from the saved ground and surviving items. The incremental journal
-  // cannot unwind a batch with shared ground/blocks reliably. This also follows
-  // the same natural-tree restoration and greenery rules as opening a project.
-  if (fullCompose) recompose(what); else retouch(ids, what);
+  const ids = selItems().map(i => i.id); if (!ids.length) return;
+  return townCommand(() => {
+    const its = TOWN.scene.items.filter(i => ids.includes(i.id)); if (!its.length) return;
+    if (TOWN_GEN_PENDING) { tStatus('街区正在重新生成，请等生成完成后再编辑。', true); return; }
+    pushHist();
+    HIST[HIST.length - 1].fullCompose = true;
+    // deleting something the generator placed: keep the generator from putting it back there
+    TOWN.suppress = TOWN.suppress || [];
+    for (const it of its) if (!it.manual) { const b = TOWN.boxes.get(it.id); if (b) TOWN.suppress.push([b[0][0], b[0][2], b[1][0], b[1][2]]); }
+    TOWN.scene.items = TOWN.scene.items.filter(x => !ids.includes(x.id)); SEL = null;
+    const what = its.length > 1 ? `删除了 ${its.length} 个组件` : `删除了 ${TYPE_CN[its[0].type]} #${its[0].id}`;
+    // Rebuild from the saved ground and surviving items. The incremental journal
+    // cannot restore shared ground or cleared-tree positions reliably. This follows
+    // the same natural-tree restoration and greenery rules as opening a project.
+    return recompose(what);
+  });
 }
 // copies land next to the originals: try right, below, left, above until the group fits
 function duplicateSel() {
@@ -4352,7 +4390,7 @@ function restore(sn) {
   const before = new Map(TOWN.scene.items.map(i => [i.id, JSON.stringify(i)])), after = new Map(sn.items.map(i => [i.id, JSON.stringify(i)]));
   const changed = [...new Set([...before.keys(), ...after.keys()])].filter(id => before.get(id) !== after.get(id));
   TOWN.scene.items = sn.items; TOWN.suppress = sn.suppress || []; if (SEL && !selItem()) SEL = null;
-  if (sn.fullCompose) recompose('撤销 / 重做'); else retouch(changed, '撤销 / 重做');
+  return sn.fullCompose ? recompose('撤销 / 重做') : retouch(changed, '撤销 / 重做');
 }
 // 道路编辑的撤销: a snapshot of the road layers goes onto the same layout undo stack as component edits.
 // Edits arriving within 800 ms of each other on the same field (typing a number) count as one step.
@@ -4370,8 +4408,8 @@ function restoreRoads(sn) {
   clearTimeout(roadEditT); if (TOWN) runTown();
 }
 function pushHist() { const sn = snapshot(); if (!sn) return; HIST.push(sn); if (HIST.length > 50) HIST.shift(); REDO.length = 0; }
-function undoHist() { const sn = HIST.pop(); if (!sn) { renderSel(); return; } const cur = sn.kind === 'roads' ? roadSnap() : sn.kind === 'green' ? greenSnap() : snapshot(); if (!cur) { renderSel(); return; } if (sn.fullCompose) cur.fullCompose = true; REDO.push(cur); sn.kind === 'roads' ? restoreRoads(sn) : sn.kind === 'green' ? greenRestore(sn) : restore(sn); renderSel(); }
-function redoHist() { const sn = REDO.pop(); if (!sn) { renderSel(); return; } const cur = sn.kind === 'roads' ? roadSnap() : sn.kind === 'green' ? greenSnap() : snapshot(); if (!cur) { renderSel(); return; } if (sn.fullCompose) cur.fullCompose = true; HIST.push(cur); sn.kind === 'roads' ? restoreRoads(sn) : sn.kind === 'green' ? greenRestore(sn) : restore(sn); renderSel(); }
+function undoHist(queued = false) { if (!queued && curMode() === 'layout' && TOWN) return townCommand(() => undoHist(true)); const sn = HIST.pop(); if (!sn) { renderSel(); return; } const cur = sn.kind === 'roads' ? roadSnap() : sn.kind === 'green' ? greenSnap() : snapshot(); if (!cur) { renderSel(); return; } if (sn.fullCompose) cur.fullCompose = true; REDO.push(cur); const result = sn.kind === 'roads' ? restoreRoads(sn) : sn.kind === 'green' ? greenRestore(sn) : restore(sn); renderSel(); return result; }
+function redoHist(queued = false) { if (!queued && curMode() === 'layout' && TOWN) return townCommand(() => redoHist(true)); const sn = REDO.pop(); if (!sn) { renderSel(); return; } const cur = sn.kind === 'roads' ? roadSnap() : sn.kind === 'green' ? greenSnap() : snapshot(); if (!cur) { renderSel(); return; } if (sn.fullCompose) cur.fullCompose = true; HIST.push(cur); const result = sn.kind === 'roads' ? restoreRoads(sn) : sn.kind === 'green' ? greenRestore(sn) : restore(sn); renderSel(); return result; }
 // ---- layout roads: each finished stroke / point path becomes a road in the list
 // a road end within reach of another road snaps onto that road's centreline, so the two connect
 function snapToRoads(pt, skip) {
