@@ -1,5 +1,18 @@
 # JS ↔ Python 一致性测试
 
+## Project restoration, facade and plaza editing
+
+After `python build_viewer.py`, run `node web/test/project-plaza-facade.cjs`.
+This checks returned cathedral specs, incremental well edits versus a full rebuild,
+and real collisions with roads, houses and another well. Set `MCGEN_BASELINE` to
+an unchanged checkout to additionally compare generated block geometry.
+
+Run `node web/test/project-browser.cjs` with Playwright installed to check project
+open/save/export, manual and automatic scenes, legacy projects, and well editing
+with undo/redo and collision rollback. Both workers and the synchronous fallback
+are exercised. `PLAYWRIGHT_MODULE`, `BROWSER_EXE` and `REGRESSION_OUT` optionally
+select an existing Playwright package, browser executable and output directory.
+
 ## Texture import regression tests
 
 Requires Node.js, Playwright, Microsoft Edge, and Python for ZIP fixtures.

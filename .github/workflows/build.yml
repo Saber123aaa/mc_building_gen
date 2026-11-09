@@ -43,6 +43,8 @@ jobs:
           node web/test/baroque.js
           node web/test/baroque-town.js
           python -X utf8 web/test/baroque_python.py
+      - name: 立面参数往返与广场水井碰撞回归
+        run: node web/test/project-plaza-facade.cjs
       - name: 道路、桥头和路口边界回归
         run: |
           node web/test/road-design.cjs > road-design-tests.json
